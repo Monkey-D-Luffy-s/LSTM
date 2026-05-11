@@ -1,0 +1,6 @@
+{
+  "name": "LSTM Trading Predictor",
+  "description": "A dashboard for predicting cryptocurrency or stock price directions using LSTM neural networks and technical indicators like RSI, MACD, EMA, and VWAP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
