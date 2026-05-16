@@ -36,6 +36,8 @@ except ImportError as e:
 FEATURES = ['open', 'high', 'low', 'close', 'volume', 'rsi', 'macd', 'ema', 'ema9', 'sma20', 'vwap', 'volatility', 'bb_upper', 'bb_lower', 'atr']
 MODEL_PATH = 'model.keras'
 SCALER_PATH = 'scaler.gz'
+THRESHOLD_PATH = 'threshold.json'
+
 
 def calculate_indicators(df):
     """
@@ -93,20 +95,22 @@ def calculate_indicators(df):
         print(f"Error calculating indicators: {e}")
         raise
 
-def prepare_train_data(df, window_size=60):
+def prepare_train_data(df, window_size=60, horizon=2):
+    """Prepare (X, y) where X is a window ending at time t and y is whether close(t+horizon) > close(t)."""
     data = df[FEATURES].values
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
-    
+
     X = []
     y = []
-    
-    for i in range(window_size, len(scaled_data) - 2):
-        X.append(scaled_data[i-window_size:i])
-        # Target: Predict UP moves (price is higher in 2 candles)
-        y.append(1 if df['close'].iloc[i+2] > df['close'].iloc[i] else 0)
-        
+
+    # i is the window end index (t). Need i + horizon to exist.
+    for i in range(window_size, len(scaled_data) - horizon):
+        X.append(scaled_data[i - window_size:i])
+        y.append(1 if df['close'].iloc[i + horizon] > df['close'].iloc[i] else 0)
+
     return np.array(X), np.array(y), scaler
+
 
 def focal_loss(gamma=2.0, alpha=0.5):
     def focal_loss_fixed(y_true, y_pred):
@@ -198,65 +202,168 @@ def load_and_preprocess(csv_path, limit=15000):
         return None
 
 def train(csv_path):
+    from sklearn.model_selection import train_test_split
+
     df = load_and_preprocess(csv_path, limit=15000)
-    if df is None: return
+    if df is None:
+        return
 
     df = calculate_indicators(df)
-    window_size = 50 
-    X, y, scaler = prepare_train_data(df, window_size)
-    
+
+    window_size = 50
+    horizon = 2
+
+    X, y, scaler = prepare_train_data(df, window_size, horizon=horizon)
+
     print(f"Sliding window applied: Created {len(X)} training sequences.")
+
+    # Train/val split for threshold tuning (time-ordered split to avoid leakage)
+    # X is already built from sequential windows; random shuffling breaks temporal validity.
+    split_idx = int(len(X) * 0.8)
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+
     model = build_model((X.shape[1], X.shape[2]))
-    
+
+    # Ensure we don't compute class weights on empty splits
     from sklearn.utils.class_weight import compute_class_weight
-    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
-    class_weight_dict = {cls: weight for cls, weight in zip(np.unique(y), class_weights)}
-    
-    # Use EarlyStopping to train until convergence without overfitting
-    early_stop = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-    
-    model.fit(X, y, batch_size=64, epochs=50, verbose=1, callbacks=[early_stop], class_weight=class_weight_dict)
-    
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weight_dict = {cls: weight for cls, weight in zip(np.unique(y_train), class_weights)}
+
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+    model.fit(
+        X_train,
+        y_train,
+        batch_size=64,
+        epochs=50,
+        verbose=1,
+        callbacks=[early_stop],
+        class_weight=class_weight_dict,
+        validation_data=(X_val, y_val),
+        shuffle=True,
+    )
+
+    # Find best threshold on validation set (optimize F1 instead of accuracy)
+    # Accuracy can be misleading when classes are imbalanced.
+    val_probs = model.predict(X_val, verbose=0).reshape(-1)
+    y_val = y_val.reshape(-1).astype(int)
+
+    def f1_score_from_preds(y_true, y_pred):
+        tp = np.sum((y_true == 1) & (y_pred == 1))
+        fp = np.sum((y_true == 0) & (y_pred == 1))
+        fn = np.sum((y_true == 1) & (y_pred == 0))
+        precision = tp / (tp + fp + 1e-12)
+        recall = tp / (tp + fn + 1e-12)
+        return 2 * precision * recall / (precision + recall + 1e-12)
+
+    # Threshold sweep on validation set (optimize F1), but avoid degenerate thresholds
+    # that make the model predict only one class (common when training/val are tiny).
+    best_thr = 0.5
+    best_f1 = -1.0
+
+    # Guardrail: require that the model predicts UP for a non-trivial fraction.
+    # If not, the threshold is likely an artifact of tiny/noisy validation.
+    min_positive_ratio = 0.2
+    max_positive_ratio = 0.8
+
+    for thr in np.linspace(0.05, 0.95, 181):
+        y_pred = (val_probs >= thr).astype(int)
+
+        positive_ratio = float(np.mean(y_pred))  # fraction of UP predictions
+        if positive_ratio < min_positive_ratio or positive_ratio > max_positive_ratio:
+            continue
+
+        f1 = f1_score_from_preds(y_val, y_pred)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+
+    # If guardrails rejected everything, fall back to the best F1 without guardrails.
+    if best_f1 < 0:
+        for thr in np.linspace(0.05, 0.95, 181):
+            y_pred = (val_probs >= thr).astype(int)
+            f1 = f1_score_from_preds(y_val, y_pred)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thr = float(thr)
+
+
+
+    # Persist threshold and horizon for consistent inference
+    import json
+
+    with open(THRESHOLD_PATH, 'w', encoding='utf-8') as f:
+        json.dump({'threshold': best_thr, 'horizon': horizon, 'window_size': window_size}, f)
+
     model.save(MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
-    print("Training complete.")
-    
-    # Cleanup memory
+    print(f"Training complete. Best threshold={best_thr:.2f}, val_best_f1={best_f1*100:.2f}%")
+
+
     tf.keras.backend.clear_session()
     gc.collect()
+
 
 def predict(csv_path):
     if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
         print("Error: Model or scaler not found. Please train the model first.")
         return
 
+    if not os.path.exists(THRESHOLD_PATH):
+        print("Error: threshold.json not found. Train again so threshold is saved.")
+        return
+
+
     # For prediction, we only need a max of 200 candles to warm up the indicators
     df = load_and_preprocess(csv_path, limit=200)
-    if df is None: return
+    if df is None:
+        return
 
     df = calculate_indicators(df)
     scaler = joblib.load(SCALER_PATH)
     model = load_model(MODEL_PATH, custom_objects={'focal_loss_fixed': focal_loss()})
-    
-    window_size = 50
-    if len(df) < window_size:
-        print(f"Error: Need at least {window_size} candles for prediction.")
+
+    import json
+    with open(THRESHOLD_PATH, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+
+    threshold = float(cfg.get('threshold', 0.5))
+    horizon = int(cfg.get('horizon', 2))
+    window_size = int(cfg.get('window_size', 50))
+
+    if len(df) < window_size + horizon:
+        print(f"Error: Need at least {window_size + horizon} candles for horizon={horizon} prediction.")
         return
 
-    last_window = df[FEATURES].tail(window_size).values
-    scaled_window = scaler.transform(last_window)
-    X_input = np.expand_dims(scaled_window, axis=0)
-    
-    pred = model.predict(X_input, verbose=0)[0][0]
-    direction = "UP" if pred >= 0.5 else "DOWN"
-    confidence = pred if pred >= 0.5 else (1 - pred)
-    
+    # Rolling prediction: for each window ending at t, predict whether close(t+horizon) > close(t)
+    X_all = []
+    y_close_t = []
+    for i in range(window_size, len(df) - horizon):
+        window = df[FEATURES].iloc[i - window_size:i].values
+        scaled_window = scaler.transform(window)
+        X_all.append(scaled_window)
+        y_close_t.append(float(df['close'].iloc[i]))
+
+    X_all = np.array(X_all)
+    probs = model.predict(X_all, verbose=0).reshape(-1)
+
+    directions = np.where(probs >= threshold, "UP", "DOWN")
+    confidences = np.where(probs >= threshold, probs, 1 - probs)
+
+    # Output the last prediction aligned with the most recent available time t
+    direction = directions[-1]
+    confidence = float(confidences[-1])
+
     print(f"RESULT_DIRECTION:{direction}")
     print(f"RESULT_CONFIDENCE:{confidence * 100:.2f}")
+    print(f"THRESHOLD_USED:{threshold:.4f}")
+    print(f"HORIZON_USED:{horizon}")
 
-    # Cleanup
     tf.keras.backend.clear_session()
     gc.collect()
+
 
 def main():
     if len(sys.argv) < 3:
@@ -275,3 +382,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+

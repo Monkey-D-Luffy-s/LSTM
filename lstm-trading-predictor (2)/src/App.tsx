@@ -55,7 +55,7 @@ const generateMockData = () => {
 export default function App() {
   const [isTraining, setIsTraining] = useState(false);
   const [isPredicting, setIsPredicting] = useState(false);
-  const [prediction, setPrediction] = useState<{ direction: 'UP' | 'DOWN', confidence: number } | null>(null);
+  const [prediction, setPrediction] = useState<{ direction: 'UP' | 'DOWN', confidence: number, currentPrice?: number } | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [chartData, setChartData] = useState(generateMockData());
 
@@ -94,20 +94,15 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const handleTrain = async (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const handleTrain = async () => {
     setIsTraining(true);
-    addLog(`Starting training with ${file.name}...`);
-
-    const formData = new FormData();
-    formData.append('file', file);
+    addLog(`Fetching 60d of live market data for training...`);
 
     try {
       const res = await fetch('/api/train', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker: '^NSEI' }),
       });
       const data = await res.json();
       if (res.ok) {
@@ -125,25 +120,20 @@ export default function App() {
     }
   };
 
-  const handlePredict = async (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const handlePredict = async () => {
     setIsPredicting(true);
     setPrediction(null);
-    addLog(`Running inference for ${file.name}...`);
-
-    const formData = new FormData();
-    formData.append('file', file);
+    addLog(`Running inference on live market data...`);
 
     try {
       const res = await fetch('/api/predict', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker: '^NSEI' }),
       });
       const data = await res.json();
       if (res.ok) {
-        setPrediction({ direction: data.direction, confidence: data.confidence });
+        setPrediction({ direction: data.direction, confidence: data.confidence, currentPrice: data.currentPrice });
         addLog(`Inference complete: Next candle is ${data.direction}.`);
       } else {
         addLog(`Prediction failed: ${data.error}`);
@@ -210,43 +200,37 @@ export default function App() {
             <h2 className="text-[10px] uppercase text-slate-500 tracking-widest mb-4 border-b border-border-subtle pb-2 font-bold">Training Suite</h2>
             <div className="space-y-6 flex-1">
               <div className="group relative">
-                <label className="block text-[9px] uppercase font-bold text-slate-500 mb-2 tracking-widest">Dataset Upload (50k+)</label>
-                <div className={cn(
-                  "border-2 border-dashed rounded-xl p-4 transition-all flex flex-col items-center justify-center text-center cursor-pointer",
-                  isTraining ? "border-accent-cyan bg-accent-cyan/5" : "border-slate-800 hover:border-slate-600"
-                )}>
+                <label className="block text-[9px] uppercase font-bold text-slate-500 mb-2 tracking-widest">Dataset Sync (60d/5m)</label>
+                <button 
+                  onClick={handleTrain} 
+                  disabled={isTraining}
+                  className={cn(
+                    "w-full border-2 border-dashed rounded-xl p-4 transition-all flex flex-col items-center justify-center text-center cursor-pointer",
+                    isTraining ? "border-accent-cyan bg-accent-cyan/5" : "border-slate-800 hover:border-slate-600 hover:bg-white/5"
+                  )}
+                >
                   <Database className={cn("w-6 h-6 mb-2", isTraining ? "text-accent-cyan animate-pulse" : "text-slate-600")} />
                   <span className="text-[10px] text-slate-400 font-mono">
-                    {isTraining ? 'Training Model...' : 'DROP .CSV TO TRAIN'}
+                    {isTraining ? 'Training Model...' : 'SYNC LIVE & TRAIN'}
                   </span>
-                  <input 
-                    type="file" 
-                    onChange={handleTrain} 
-                    accept=".csv"
-                    className="absolute inset-0 opacity-0 cursor-pointer"
-                    disabled={isTraining}
-                  />
-                </div>
+                </button>
               </div>
 
               <div className="group relative">
-                <label className="block text-[9px] uppercase font-bold text-slate-500 mb-2 tracking-widest">Inference Upload (50-100)</label>
-                <div className={cn(
-                  "border-2 border-dashed rounded-xl p-4 transition-all flex flex-col items-center justify-center text-center cursor-pointer",
-                  isPredicting ? "border-accent-emerald bg-accent-emerald/5" : "border-slate-800 hover:border-slate-600"
-                )}>
+                <label className="block text-[9px] uppercase font-bold text-slate-500 mb-2 tracking-widest">Inference Run (5d/5m)</label>
+                <button 
+                  onClick={handlePredict} 
+                  disabled={isPredicting || isTraining}
+                  className={cn(
+                    "w-full border-2 border-dashed rounded-xl p-4 transition-all flex flex-col items-center justify-center text-center cursor-pointer",
+                    isPredicting ? "border-accent-emerald bg-accent-emerald/5" : "border-slate-800 hover:border-slate-600 hover:bg-white/5"
+                  )}
+                >
                   <BrainCircuit className={cn("w-6 h-6 mb-2", isPredicting ? "text-accent-emerald animate-pulse" : "text-slate-600")} />
                   <span className="text-[10px] text-slate-400 font-mono">
-                    {isPredicting ? 'Inferring...' : 'DROP .CSV TO PREDICT'}
+                    {isPredicting ? 'Inferring...' : 'FETCH LIVE & PREDICT'}
                   </span>
-                  <input 
-                    type="file" 
-                    onChange={handlePredict} 
-                    accept=".csv"
-                    className="absolute inset-0 opacity-0 cursor-pointer"
-                    disabled={isPredicting || isTraining}
-                  />
-                </div>
+                </button>
               </div>
             </div>
             
@@ -313,7 +297,7 @@ export default function App() {
                 >
                   <p className="text-slate-500 text-xs tracking-[0.4em] uppercase mb-6 font-bold">Neural Engine Offline</p>
                   <div className="text-sm text-slate-400 font-mono max-w-sm">
-                    Upload a history file (50k samples) to train, then provide recent data (50+ samples) for real-time market foresight.
+                    Sync 60 days of live market data to train the model, then fetch the latest values for real-time foresight.
                   </div>
                 </motion.div>
               ) : isPredicting ? (
@@ -345,19 +329,26 @@ export default function App() {
                   )}>
                     {prediction?.direction === 'UP' ? 'BULLISH' : 'BEARISH'}
                   </h3>
-                  <div className="flex items-center justify-center gap-8 mt-12 bg-black/20 p-6 rounded-3xl border border-white/5 backdrop-blur-sm">
-                    <div className="text-left">
-                      <p className="text-[9px] text-slate-500 uppercase font-black tracking-[0.2em] mb-1">Confidence</p>
-                      <p className="text-5xl font-mono text-white leading-none">{prediction?.confidence}<span className="text-xl text-slate-500">%</span></p>
+                  <div className="flex flex-col gap-4 items-center mt-12">
+                    <div className="bg-white/5 border border-white/10 rounded-xl px-6 py-3 flex items-center gap-4 backdrop-blur-sm">
+                      <span className="text-[9px] uppercase tracking-[0.2em] text-slate-400 font-bold">Current Value</span>
+                      <span className="text-xl font-mono text-white">{prediction?.currentPrice ? prediction.currentPrice.toLocaleString() : '---'}</span>
                     </div>
-                    <div className="w-px h-12 bg-slate-800"></div>
-                    <div className="text-left">
-                      <p className="text-[9px] text-slate-500 uppercase font-black tracking-[0.2em] mb-1">Signal Bias</p>
-                      <div className={cn(
-                        "text-5xl font-mono leading-none flex items-center gap-2",
-                        prediction?.direction === 'UP' ? "text-accent-emerald" : "text-red-500"
-                      )}>
-                        {prediction?.direction === 'UP' ? <TrendingUp /> : <TrendingDown />}
+                    
+                    <div className="flex items-center justify-center gap-8 bg-black/20 p-6 rounded-3xl border border-white/5 backdrop-blur-sm">
+                      <div className="text-left">
+                        <p className="text-[9px] text-slate-500 uppercase font-black tracking-[0.2em] mb-1">Confidence</p>
+                        <p className="text-5xl font-mono text-white leading-none">{prediction?.confidence}<span className="text-xl text-slate-500">%</span></p>
+                      </div>
+                      <div className="w-px h-12 bg-slate-800"></div>
+                      <div className="text-left">
+                        <p className="text-[9px] text-slate-500 uppercase font-black tracking-[0.2em] mb-1">Signal Bias</p>
+                        <div className={cn(
+                          "text-5xl font-mono leading-none flex items-center gap-2",
+                          prediction?.direction === 'UP' ? "text-accent-emerald" : "text-red-500"
+                        )}>
+                          {prediction?.direction === 'UP' ? <TrendingUp /> : <TrendingDown />}
+                        </div>
                       </div>
                     </div>
                   </div>

@@ -8,9 +8,10 @@ try:
     import os
     import sys
     import joblib
+    import yfinance as yf
 except ImportError as e:
     print(f"[CRITICAL ERROR] Missing Python dependency: {e}")
-    print("Please run: pip install pandas numpy scikit-learn tensorflow joblib")
+    print("Please run: pip install pandas numpy scikit-learn tensorflow joblib yfinance")
     sys.exit(1)
 
 # To run this script, you will need:
@@ -58,7 +59,34 @@ def calculate_indicators(df):
         print(f"Error calculating indicators: {e}")
         raise
 
-def prepare_train_data(df, window_size=60):
+def fetch_yfinance_data(ticker, period="60d", interval="5m"):
+    try:
+        print(f"Fetching {period} of {interval} data for {ticker} from yfinance...")
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval)
+        if df.empty:
+            raise ValueError(f"No data returned for ticker {ticker}")
+        
+        # Reset index to get dates as a column
+        df.reset_index(inplace=True)
+        
+        # Some versions return MultiIndex columns, just get the first level
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        df.columns = [c.lower() for c in df.columns]
+        
+        # Select required columns
+        required = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required):
+            raise ValueError(f"Missing required columns from yfinance data. Found: {list(df.columns)}")
+            
+        return df[required]
+    except Exception as e:
+        print(f"Error fetching yfinance data: {e}")
+        return None
+
+def prepare_train_data(df, window_size=50):
     data = df[FEATURES].values
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
@@ -131,12 +159,16 @@ def load_and_preprocess(csv_path):
         print(f"Error loading data: {e}")
         return None
 
-def train(csv_path):
-    df = load_and_preprocess(csv_path)
+def train(target):
+    if target.endswith('.csv'):
+        df = load_and_preprocess(target)
+    else:
+        df = fetch_yfinance_data(target, period="60d", interval="5m")
+        
     if df is None: return
 
     df = calculate_indicators(df)
-    window_size = 100 
+    window_size = 50 
     X, y, scaler = prepare_train_data(df, window_size)
     
     print(f"Sliding window applied: Created {len(X)} training sequences from {len(df)} candles.")
@@ -147,19 +179,23 @@ def train(csv_path):
     joblib.dump(scaler, SCALER_PATH)
     print("Training complete.")
 
-def predict(csv_path):
+def predict(target):
     if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
         print("Error: Model or scaler not found. Please train the model first.")
         return
 
-    df = load_and_preprocess(csv_path)
+    if target.endswith('.csv'):
+        df = load_and_preprocess(target)
+    else:
+        df = fetch_yfinance_data(target, period="5d", interval="5m")
+        
     if df is None: return
 
     df = calculate_indicators(df)
     scaler = joblib.load(SCALER_PATH)
     model = load_model(MODEL_PATH)
     
-    window_size = 100
+    window_size = 50
     if len(df) < window_size:
         print(f"Error: Need at least {window_size} candles for prediction.")
         return
@@ -172,6 +208,9 @@ def predict(csv_path):
     direction = "UP" if pred >= 0.5 else "DOWN"
     confidence = pred if pred >= 0.5 else (1 - pred)
     
+    current_price = df['close'].iloc[-1]
+    
+    print(f"CURRENT_PRICE:{current_price:.2f}")
     print(f"RESULT_DIRECTION:{direction}")
     print(f"RESULT_CONFIDENCE:{confidence * 100:.2f}")
 

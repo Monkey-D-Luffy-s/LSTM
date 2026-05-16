@@ -34,10 +34,10 @@ async function startServer() {
 
   // API: Train
   app.post("/api/train", upload.single("file"), (req: any, res: any) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const ticker = req.body.ticker || "^NSEI";
+    const target = req.file ? req.file.path : ticker;
 
-    const filePath = req.file.path;
-    let pythonProcess = spawn(pythonCmd, ["predictor.py", "train", filePath]);
+    let pythonProcess = spawn(pythonCmd, ["predictor.py", "train", target]);
 
     let logs = "";
     pythonProcess.on("error", (err: any) => {
@@ -59,8 +59,8 @@ async function startServer() {
     });
 
     pythonProcess.on("close", (code) => {
-      // Clean up upload
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      // Clean up upload if exists
+      if (req.file && fs.existsSync(target)) fs.unlinkSync(target);
       
       if (code === 0) {
         res.json({ message: "Training complete", logs });
@@ -85,10 +85,10 @@ async function startServer() {
 
   // API: Predict
   app.post("/api/predict", upload.single("file"), (req: any, res: any) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const ticker = req.body.ticker || "^NSEI";
+    const target = req.file ? req.file.path : ticker;
 
-    const filePath = req.file.path;
-    const pythonProcess = spawn(pythonCmd, ["predictor.py", "predict", filePath]);
+    const pythonProcess = spawn(pythonCmd, ["predictor.py", "predict", target]);
 
     let output = "";
     pythonProcess.on("error", (err: any) => {
@@ -106,16 +106,18 @@ async function startServer() {
     });
 
     pythonProcess.on("close", (code) => {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      if (req.file && fs.existsSync(target)) fs.unlinkSync(target);
 
       if (code === 0) {
         const directionMatch = output.match(/RESULT_DIRECTION:(UP|DOWN)/);
         const confidenceMatch = output.match(/RESULT_CONFIDENCE:([\d.]+)/);
+        const currentPriceMatch = output.match(/CURRENT_PRICE:([\d.]+)/);
 
         if (directionMatch && confidenceMatch) {
           res.json({
             direction: directionMatch[1],
             confidence: parseFloat(confidenceMatch[1]),
+            currentPrice: currentPriceMatch ? parseFloat(currentPriceMatch[1]) : null,
             logs: output
           });
         } else {
